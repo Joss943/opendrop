@@ -18,14 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import logging
-import os
-import platform
 
-__version__ = "0.13.0"
-
-if platform.system() == "Darwin":
-    dyld_path = os.environ.get("DYLD_LIBRARY_PATH", "")  # save old path
-    archive_path = "/usr/local/opt/libarchive/lib"
-    os.environ["DYLD_LIBRARY_PATH"] = f"{dyld_path}:{archive_path}"
+__version__ = "0.14.0"
 
 logger = logging.getLogger(__name__)

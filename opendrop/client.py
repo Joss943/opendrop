@@ -17,42 +17,31 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import io
 import ipaddress
 import logging
 import os
-import platform
 import plistlib
 import socket
+import tempfile
 from http.client import HTTPSConnection
 
-import fleep
-import libarchive
-from zeroconf import IPVersion, ServiceBrowser, Zeroconf
-
-from .util import AbsArchiveWrite, AirDropUtil
+from . import archive, util
 
 logger = logging.getLogger(__name__)
 
+SO_RECV_ANYIF = 0x1104  # macOS: allow traffic on the AWDL interface
+
+AIRDROP_SERVICE = "_airdrop._tcp.local."
+
 
 class AirDropBrowser:
-    def __init__(self, config):
-        self.ip_addr = AirDropUtil.get_ip_for_interface(config.interface, ipv6=True)
-        if self.ip_addr is None:
-            if config.interface == "awdl0":
-                raise RuntimeError(
-                    f"Interface {config.interface} does not have an IPv6 address. Make sure that `owl` is running."
-                )
-            else:
-                raise RuntimeError(
-                    f"Interface {config.interface} does not have an IPv6 address"
-                )
+    """Discover AirDrop receivers via mDNS/DNS-SD on the given interface."""
 
-        self.zeroconf = Zeroconf(
-            interfaces=[str(self.ip_addr)],
-            ip_version=IPVersion.V6Only,
-            apple_p2p=platform.system() == "Darwin",
-        )
+    def __init__(self, config):
+        self.config = config
+        self.iface = util.require_interface(config.interface)
+        self.ip_addr = self.iface.address
+        self.zeroconf = util.make_zeroconf(self.iface, config.interface)
 
         self.callback_add = None
         self.callback_remove = None
@@ -66,85 +55,130 @@ class AirDropBrowser:
             return  # already started
         self.callback_add = callback_add
         self.callback_remove = callback_remove
-        self.browser = ServiceBrowser(self.zeroconf, "_airdrop._tcp.local.", self)
+        # zeroconf is imported lazily so that `opendrop --help` stays fast
+        from zeroconf import ServiceBrowser  # pylint: disable=import-outside-toplevel
+
+        self.browser = ServiceBrowser(self.zeroconf, AIRDROP_SERVICE, self)
 
     def stop(self):
-        self.browser.cancel()
-        self.browser = None
-        self.zeroconf.close()
+        if self.browser is not None:
+            self.browser.cancel()
+            self.browser = None
+        if self.zeroconf is not None:
+            self.zeroconf.close()
+            self.zeroconf = None
+
+    # zeroconf ServiceListener interface
 
     def add_service(self, zeroconf, service_type, name):
-        info = zeroconf.get_service_info(service_type, name)
         logger.debug(f"Add service {name}")
+        info = zeroconf.get_service_info(service_type, name)
+        if info is None:
+            logger.debug(f"Could not resolve service {name}")
+            return
         if self.callback_add is not None:
             self.callback_add(info)
 
+    def update_service(self, zeroconf, service_type, name):
+        logger.debug(f"Update service {name}")
+
     def remove_service(self, zeroconf, service_type, name):
-        info = zeroconf.get_service_info(service_type, name)
         logger.debug(f"Remove service {name}")
         if self.callback_remove is not None:
-            self.callback_remove(info)
+            self.callback_remove(name)
 
 
 class AirDropClient:
+    """Talk to a single AirDrop receiver (``/Discover``, ``/Ask``, ``/Upload``)."""
+
     def __init__(self, config, receiver):
         self.config = config
-        self.receiver_host = receiver[0]
-        self.receiver_port = receiver[1]
+        self.receiver_host = str(receiver[0]).split("%")[0]
+        self.receiver_port = int(receiver[1])
         self.http_conn = None
+        self._scope_id = None
+        iface = util.find_interface(config.interface)
+        if iface is not None:
+            self._scope_id = iface.index
 
-    def send_POST(self, url, body, headers=None):
+    def close(self):
+        if self.http_conn is not None:
+            self.http_conn.close()
+            self.http_conn = None
+
+    def send_POST(self, url, body, headers=None, timeout=None):
         logger.debug(f"Send {url} request")
 
-        AirDropUtil.write_debug(
-            self.config, body, f"send_{url.lower().strip('/')}_request.plist"
-        )
+        util.write_debug(self.config, body, f"send_{url.lower().strip('/')}_request.plist")
 
         _headers = self._get_headers()
         if headers is not None:
-            for key, val in headers.items():
-                _headers[key] = val
+            _headers.update(headers)
+
+        if timeout is None:
+            timeout = self.config.timeout
         if self.http_conn is None:
             # Use single connection
             self.http_conn = HTTPSConnectionAWDL(
                 self.receiver_host,
                 self.receiver_port,
                 interface_name=self.config.interface,
-                context=self.config.get_ssl_context(),
+                scope_id=self._scope_id,
+                timeout=timeout,
+                context=self.config.get_client_ssl_context(),
             )
-        self.http_conn.request("POST", url, body=body, headers=_headers)
-        http_resp = self.http_conn.getresponse()
+        self.http_conn.timeout = timeout
+        if self.http_conn.sock is not None:
+            self.http_conn.sock.settimeout(timeout)
 
-        response_bytes = http_resp.read()
-        AirDropUtil.write_debug(
-            self.config,
-            response_bytes,
-            f"send_{url.lower().strip('/')}_response.plist",
+        try:
+            self.http_conn.request("POST", url, body=body, headers=_headers)
+            http_resp = self.http_conn.getresponse()
+            response_bytes = http_resp.read()
+        except Exception:
+            self.close()
+            raise
+
+        util.write_debug(
+            self.config, response_bytes, f"send_{url.lower().strip('/')}_response.plist"
         )
 
         if http_resp.status != 200:
-            status = False
             logger.debug(f"{url} request failed: {http_resp.status}")
-        else:
-            status = True
-            logger.debug(f"{url} request successful")
-        return status, response_bytes
+            return False, response_bytes
+        logger.debug(f"{url} request successful")
+        return True, response_bytes
 
     def send_discover(self):
+        """
+        Returns the receiver's computer name, or ``None`` if it is not
+        discoverable by us.
+        """
         discover_body = {}
         if self.config.record_data:
             discover_body["SenderRecordData"] = self.config.record_data
 
-        discover_plist_binary = plistlib.dumps(
-            discover_body, fmt=plistlib.FMT_BINARY  # pylint: disable=no-member
-        )
-        _, response_bytes = self.send_POST("/Discover", discover_plist_binary)
-        response = plistlib.loads(response_bytes)
+        discover_plist_binary = plistlib.dumps(discover_body, fmt=plistlib.FMT_BINARY)
+        success, response_bytes = self.send_POST("/Discover", discover_plist_binary)
+        if not success or not response_bytes:
+            return None
+        try:
+            response = plistlib.loads(response_bytes)
+        except (plistlib.InvalidFileException, ValueError):
+            logger.debug("Invalid /Discover response")
+            return None
 
         # if name is returned, then receiver is discoverable
         return response.get("ReceiverComputerName")
 
     def send_ask(self, file_path, is_url=False, icon=None):
+        """
+        Ask the receiver to accept the given file(s) or URL(s). Blocks until
+        the user on the other side accepts/declines (or ``ask_timeout``).
+        """
+        paths = [file_path] if isinstance(file_path, (str, os.PathLike)) else list(file_path)
+        paths = [os.fspath(p) for p in paths]
+
         ask_body = {
             "SenderComputerName": self.config.computer_name,
             "BundleID": "com.apple.finder",
@@ -155,77 +189,58 @@ class AirDropClient:
         if self.config.record_data:
             ask_body["SenderRecordData"] = self.config.record_data
 
-        def file_entries(files):
-            for file in files:
-                file_name = os.path.basename(file)
-                file_entry = {
-                    "FileName": file_name,
-                    "FileType": AirDropUtil.get_uti_type(flp),
-                    "FileBomPath": os.path.join(".", file_name),
-                    "FileIsDirectory": os.path.isdir(file_name),
+        if is_url:
+            ask_body["Items"] = paths
+        else:
+            ask_body["Files"] = [
+                {
+                    "FileName": os.path.basename(os.path.normpath(p)),
+                    "FileType": util.get_uti_type(p),
+                    "FileBomPath": "./" + os.path.basename(os.path.normpath(p)),
+                    "FileIsDirectory": os.path.isdir(p),
                     "ConvertMediaFormats": 0,
                 }
-                yield file_entry
-
-        if isinstance(file_path, str):
-            file_path = [file_path]
-        if is_url:
-            ask_body["Items"] = file_path
-        else:
-            # generate icon for first file
-            with open(file_path[0], "rb") as f:
-                file_header = f.read(128)
-                flp = fleep.get(file_header)
-                if not icon and len(flp.mime) > 0 and "image" in flp.mime[0]:
-                    icon = AirDropUtil.generate_file_icon(f.name)
-            ask_body["Files"] = [e for e in file_entries(file_path)]
+                for p in paths
+            ]
+            if icon is None and util.is_image(paths[0]):
+                icon = util.generate_file_icon(paths[0])
         if icon:
             ask_body["FileIcon"] = icon
 
-        ask_binary = plistlib.dumps(
-            ask_body, fmt=plistlib.FMT_BINARY  # pylint: disable=no-member
-        )
-        success, _ = self.send_POST("/Ask", ask_binary)
-
+        ask_binary = plistlib.dumps(ask_body, fmt=plistlib.FMT_BINARY)
+        success, _ = self.send_POST("/Ask", ask_binary, timeout=self.config.ask_timeout)
         return success
 
     def send_upload(self, file_path, is_url=False):
         """
-        Send a file to a receiver.
+        Send file(s) to a receiver as a gzip-compressed CPIO archive.
         """
         # Don't send an upload request if we just sent a link
         if is_url:
-            return
+            return True
 
-        headers = {
-            "Content-Type": "application/x-cpio",
-        }
+        paths = [file_path] if isinstance(file_path, (str, os.PathLike)) else list(file_path)
 
-        # Create archive in memory ...
-        stream = io.BytesIO()
-        with libarchive.custom_writer(
-            stream.write,
-            "cpio",
-            filter_name="gzip",
-            archive_write_class=AbsArchiveWrite,
-        ) as archive:
-            for f in [file_path]:
-                ff = os.path.basename(f)
-                archive.add_abs_file(f, os.path.join(".", ff))
-        stream.seek(0)
+        headers = {"Content-Type": "application/x-cpio"}
 
-        # ... then send in chunked mode
-        success, _ = self.send_POST("/Upload", stream, headers=headers)
-
-        # TODO better: write archive chunk whenever send_POST does a read to avoid having the whole archive in memory
-
+        # Build the archive in a temporary file (kept in memory while small) so
+        # that large files do not have to fit into RAM.
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as stream:
+            archive.write_archive(stream, [os.fspath(p) for p in paths])
+            stream.seek(0)
+            # No Content-Length -> http.client uses chunked transfer encoding,
+            # which is what AirDrop receivers expect.
+            success, _ = self.send_POST(
+                "/Upload", stream, headers=headers, timeout=max(self.config.timeout, 60)
+            )
         return success
 
-    def _get_headers(self):
+    @staticmethod
+    def _get_headers():
         """
         Get the headers for requests sent
         """
-        headers = {
+        return {
             "Content-Type": "application/octet-stream",
             "Connection": "keep-alive",
             "Accept": "*/*",
@@ -233,88 +248,61 @@ class AirDropClient:
             "Accept-Language": "en-us",
             "Accept-Encoding": "br, gzip, deflate",
         }
-        return headers
 
 
 class HTTPSConnectionAWDL(HTTPSConnection):
     """
-    This class allows to bind the HTTPConnection to a specific network interface
+    HTTPS connection that works with IPv6 link-local addresses on every OS
+    (by passing the numeric scope id) and with macOS' AWDL interface.
     """
 
     def __init__(
         self,
         host,
         port=None,
-        key_file=None,
-        cert_file=None,
         timeout=None,
-        source_address=None,
         *,
         context=None,
-        check_hostname=None,
         interface_name=None,
+        scope_id=None,
     ):
-
-        if interface_name is not None:
-            if "%" not in host:
-                if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
-                    host = host + "%" + interface_name
-
-        if timeout is None:
-            timeout = socket.getdefaulttimeout()
-
-        super(HTTPSConnectionAWDL, self).__init__(
-            host=host,
-            port=port,
-            key_file=key_file,
-            cert_file=cert_file,
-            timeout=timeout,
-            source_address=source_address,
-            context=context,
-            check_hostname=check_hostname,
-        )
-
+        host = str(host).split("%")[0]
+        super().__init__(host=host, port=port, timeout=timeout, context=context)
         self.interface_name = interface_name
-        self._create_connection = self.create_connection_awdl
+        self.scope_id = scope_id
 
-    def create_connection_awdl(
-        self, address, timeout=socket.getdefaulttimeout(), source_address=None
-    ):
-        """Connect to *address* and return the socket object.
+    def _candidate_addresses(self):
+        try:
+            addr = ipaddress.ip_address(self.host)
+        except ValueError:
+            addr = None
+        if isinstance(addr, ipaddress.IPv6Address) and addr.is_link_local and self.scope_id:
+            return [(socket.AF_INET6, (self.host, self.port, 0, int(self.scope_id)))]
+        return [
+            (af, sa)
+            for af, _, _, _, sa in socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+        ]
 
-        Convenience function.  Connect to *address* (a 2-tuple ``(host,
-        port)``) and return the socket object.  Passing the optional
-        *timeout* parameter will set the timeout on the socket instance
-        before attempting to connect.  If no *timeout* is supplied, the
-        global default timeout setting returned by :func:`getdefaulttimeout`
-        is used.  If *source_address* is set it must be a tuple of (host, port)
-        for the socket to bind as a source address before making the connection.
-        A host of '' or port 0 tells the OS to use the default.
-        """
-
-        host, port = address
+    def _connect_socket(self):
         err = None
-        for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
-            af, socktype, proto, _, sa = res
+        for af, sa in self._candidate_addresses():
             sock = None
             try:
-                sock = socket.socket(af, socktype, proto)
-                if timeout is not socket.getdefaulttimeout():
-                    sock.settimeout(timeout)
-                if self.interface_name == "awdl0" and platform.system() == "Darwin":
-                    sock.setsockopt(socket.SOL_SOCKET, 0x1104, 1)
-                if source_address:
-                    sock.bind(source_address)
+                sock = socket.socket(af, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                if util.is_macos() and util.is_awdl(self.interface_name or ""):
+                    sock.setsockopt(socket.SOL_SOCKET, SO_RECV_ANYIF, 1)
                 sock.connect(sa)
-                # Break explicitly a reference cycle
                 return sock
-
-            except socket.error as _:
-                err = _
+            except OSError as e:
+                err = e
                 if sock is not None:
                     sock.close()
-
         if err is not None:
             raise err
-        else:
-            raise socket.error("getaddrinfo returns an empty list")
+        raise OSError("getaddrinfo returned an empty list")
+
+    def connect(self):
+        sock = self._connect_socket()
+        # Peers are addressed by IP, so no SNI / hostname verification
+        self.sock = self._context.wrap_socket(sock, server_hostname=None)

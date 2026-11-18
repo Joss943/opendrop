@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opendrop"
+dynamic = ["version"]
+description = "An open Apple AirDrop implementation for macOS, Linux and Windows"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+authors = [{ name = "The Open Wireless Link Project" }]
+keywords = ["airdrop", "awdl", "file-sharing", "cli"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: Console",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: File Sharing",
+]
+dependencies = [
+    "zeroconf>=0.38",
+    "ifaddr>=0.2",
+    "cryptography>=3.4",
+    "Pillow>=8.0",
+]
+
+[project.optional-dependencies]
+libarchive = ["libarchive-c>=2.9"]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.scripts]
+opendrop = "opendrop.cli:main"
+
+[project.urls]
+"Upstream" = "https://github.com/seemoo-lab/opendrop"
+"Research Paper" = "https://usenix.org/conference/usenixsecurity19/presentation/stute"
+
+[tool.setuptools]
+packages = ["opendrop"]
+
+[tool.setuptools.package-data]
+opendrop = ["certs/*.pem"]
+
+[tool.setuptools.dynamic]
+version = { attr = "opendrop.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E501", "UP032", "B904"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

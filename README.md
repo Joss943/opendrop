@@ -1,116 +1,156 @@
-# OpenDrop: an Open Source AirDrop Implementation
+# OpenDrop: an open source AirDrop implementation
 
-[![Release](https://img.shields.io/pypi/v/opendrop?color=%23EC6500&label=release)](https://pypi.org/project/opendrop/)
-[![Language grade](https://img.shields.io/lgtm/grade/python/github/seemoo-lab/opendrop?label=code%20quality)](https://lgtm.com/projects/g/seemoo-lab/opendrop/context:python)
+[![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
-*OpenDrop* is a command-line tool that allows sharing files between devices directly over Wi-Fi. Its unique feature is that it is protocol-compatible with Apple AirDrop which allows to share files with Apple devices running iOS and macOS. 
-~~Currently (and probably also for the foreseeable future), OpenDrop only supports sending to Apple devices that are discoverable by *everybody* as the default *contacts only* mode requires [Apple-signed certificates](https://www.apple.com/certificateauthority/pdf/Apple_AAI_CPS_v6.1.pdf).~~
-We support contacts-only devices by using extracted AirDrop credentials (keys and certificates) from macOS via our [keychain extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor).
+*OpenDrop* is a command-line tool for sharing files between devices directly over Wi-Fi.
+It is protocol-compatible with Apple AirDrop, so it can exchange files with iPhones, iPads
+and Macs. It runs on **macOS, Linux and Windows**.
 
-## Disclaimer
+> This is a maintained fork of [seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop)
+> (no longer maintained upstream). It fixes many bugs, removes the native dependencies
+> (`libarchive`, `openssl`) and adds Windows support. See [CHANGELOG.md](CHANGELOG.md).
+>
+> 🇫🇷 [Lire en français](README.fr.md)
 
-OpenDrop is experimental software and is the result of reverse engineering efforts by the [Open Wireless Link](<<DISCLAIMER: The former owlink website is no longer associated with this project, please disregard it.>>) project.
-Therefore, it does not support all features of AirDrop or might be incompatible with future AirDrop versions.
-OpenDrop is not affiliated with or endorsed by Apple Inc. Use this code at your own risk.
+## What works where
 
+AirDrop only runs over Apple Wireless Direct Link (**AWDL**), a proprietary Wi-Fi link layer.
+Whether you can talk to Apple devices therefore depends on your OS:
 
-## Requirements
+| Platform | With Apple devices (iPhone, Mac…) | With other OpenDrop peers |
+|----------|-----------------------------------|---------------------------|
+| **macOS** | ✅ Native, via `awdl0` | ✅ |
+| **Linux** | ✅ With [OWL](https://github.com/seemoo-lab/owl) (needs a Wi-Fi card with monitor mode) | ✅ |
+| **Windows** | ⚠️ Not natively (no AWDL on Windows). Experimental via WSL2 + USB Wi-Fi + OWL, see [docs/WINDOWS.md](docs/WINDOWS.md) | ✅ Over any network interface (`-i Wi-Fi`) |
 
-To achieve compatibility with Apple AirDrop, OpenDrop requires the target platform to support a specific Wi-Fi link layer.
-In addition, it requires Python >=3.6 as well as several libraries.
+"OpenDrop peers" mode uses a normal network (Wi-Fi/Ethernet) instead of AWDL: any
+OpenDrop on macOS, Linux or Windows on the same network can find each other and exchange
+files, using the AirDrop protocol.
 
-**Apple Wireless Direct Link.**
-As AirDrop exclusively runs over Apple Wireless Direct Link (AWDL), OpenDrop is only supported on macOS or on Linux systems running an open re-implementation of AWDL such as [OWL](https://github.com/seemoo-lab/owl).
+Run `opendrop doctor` to check your setup.
 
-**Libraries.**
-OpenDrop relies on a current version of [libarchive](https://www.libarchive.org).
-macOS ships with a rather old version, so you will need to install a newer version, for example, via [Homebrew](https://brew.sh):
+## Installation
+
+Requires **Python 3.9+**. No native libraries are needed any more.
+
 ```bash
-brew install libarchive
-```
-OpenDrop automatically sets `DYLD_LIBRARY_PATH` to look for the Homebrew version. You may need to update the variable yourself if you install the libraries differently.
-
-Linux distributions should ship with more up-to-date versions, so this won't be necessary.
-
-
-## Installation 
-
-Installation of the Python package [release](https://pypi.org/project/opendrop/) is straightforward using `pip3`:
-```
-pip3 install opendrop
+pip install git+https://github.com/Joss943/opendrop.git
 ```
 
-You can also install the current development version by first cloning this repository, and then installing it via `pip3`:
-```
-git clone https://github.com/seemoo-lab/opendrop.git
-pip3 install ./opendrop
+or from a clone:
+
+```bash
+git clone https://github.com/Joss943/opendrop.git
+cd opendrop
+pip install .
 ```
 
+On Windows, use `py -m pip install .` if `pip` is not on your `PATH`.
+Platform-specific notes: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Usage
 
-We briefly explain how to send and receive files using `opendrop`.
-To see all command line options, run `opendrop -h`.
-
-### Sending a File or a Link
-
-Sending a file is typically a two-step procedure. You first discover devices in proximity using the `find` command.
-Stop the process once you have found the receiver.
+```text
+opendrop {receive,find,send,doctor} [options]
 ```
+
+Options shared by all commands:
+
+| Option | Meaning |
+|--------|---------|
+| `-i, --interface` | Interface to use. Default `awdl0`. On Windows the friendly name works (`-i Wi-Fi`). |
+| `-n, --name` | Computer name shown on the other device |
+| `-m, --model` | Computer model shown on the other device |
+| `-d, --debug` | Verbose logs; raw protocol messages are saved to `~/.opendrop/debug` |
+| `--config-dir` | Where keys and discovery results live (default `~/.opendrop`, or `$OPENDROP_HOME`) |
+
+### Find receivers
+
+```console
 $ opendrop find
 Looking for receivers. Press Ctrl+C to stop ...
 Found  index 0  ID eccb2f2dcfe7  name John’s iPhone
 Found  index 1  ID e63138ac6ba8  name Jane’s MacBook Pro
 ```
-You can then `send` a file (or link, see below) using 
-```
-$ opendrop send -r 0 -f /path/to/some/file
+
+Use `-t 10` to stop automatically after 10 seconds (handy in scripts).
+Results are saved to `~/.opendrop/discover.last.json` as soon as they are found.
+
+### Send files, folders or a link
+
+```console
+$ opendrop send -r 0 -f photo.jpg
 Asking receiver to accept ...
 Receiver accepted
-Uploading file ...
+Uploading file(s) ...
 Uploading has been successful
 ```
-Instead of the `index`, you can also use `ID` or `name`.
-OpenDrop will try to interpret the input in the order (1) `index`, (2) `ID`, and (3) `name` and fail if no match was found.
 
-**Sending a web link.** Since v0.13, OpenDrop supports sending web links, i.e., URLs, so that receiving Apple devices will immediately open their browser upon accepting. 
-(Note that OpenDrop _receivers_ still only support receiving regular files.)
+* `-r` accepts the **index**, the **ID** or the **name** (case-insensitive) from `find`.
+* `-f` accepts **several files and folders**: `opendrop send -r 0 -f a.pdf b.jpg Photos/`
+* Send a web link with `--url`: `opendrop send -r 0 -f https://example.org --url`
 
-```
-$ opendrop send -r 0 -f <<DISCLAIMER: The former owlink website is no longer associated with this project, please disregard it.>> --url
-```
+Exit codes: `0` success, `1` error, `2` declined by the receiver.
 
-### Receiving Files
+### Receive files
 
-Receiving is much easier. Simply use the `receive` command. OpenDrop will accept all incoming files automatically and put received files in the current directory.
-```
-$ opendrop receive
+```console
+$ opendrop receive -o ~/Downloads/AirDrop
 ```
 
+All incoming transfers are accepted automatically and stored in the `-o` directory
+(default: current directory). Existing files are never overwritten (`photo (1).jpg` is used
+instead), and malicious archives cannot write outside that directory.
 
-## Current Limitations/TODOs
+### Between two computers without AWDL
 
-OpenDrop is the result of a research project and, thus, has several limitations (non-exhaustive list below). I do not have the capacity to work on them myself but am happy to provide assistance if somebody else want to take them on.
+```bash
+# computer A (e.g. Windows)
+opendrop receive -i Wi-Fi -n "PC A"
+# computer B (e.g. Linux)
+opendrop find -i wlan0 -t 5
+opendrop send -i wlan0 -r "PC A" -f report.pdf
+```
 
-* *Triggering macOS/iOS receivers via Bluetooth Low Energy.* Apple devices start their AWDL interface and AirDrop server only after receiving a custom advertisement via Bluetooth LE (see USENIX paper for details). This means, that Apple AirDrop receivers may not be discovered even if they are discoverable by *everyone*.
+## Contacts-only receivers
 
-* *Sender/Receiver authentication and connection state.* Currently, there is no peer authentication as in Apple's AirDrop, in particular, (1) OpenDrop does not verify that the TLS certificate is signed by [Apple's root](opendrop/certs/apple_root_ca.pem) and (2) that the Apple ID validation record is correct (see USENIX paper for details). In addition, OpenDrop automatically accepts any file that it receives due to a missing connection state.
+Apple devices set to *Contacts Only* require Apple-signed certificates. You can use
+AirDrop credentials extracted from macOS with the
+[keychain extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor): put
+`certificate.pem`, `key.pem` and `validation_record.cms` into `~/.opendrop/keys/`.
+OpenDrop never overwrites certificates that are not its own self-signed ones.
 
-* *Sending multiple files.* Apple AirDrop supports sending multiple files at once, OpenDrop does not (would require adding more files to the archive, modify HTTP /Ask request, etc.).
+## Limitations
 
+* **Waking up Apple receivers via Bluetooth LE is not implemented.** Apple devices only
+  turn on AWDL after receiving a BLE advertisement, so an iPhone may not show up even when
+  it is discoverable by *Everyone*. Opening the AirDrop share sheet on the iPhone/Mac
+  usually helps.
+* **No peer authentication.** OpenDrop does not verify that the TLS certificate is signed by
+  Apple or that the validation record is valid.
+* **Receivers accept everything automatically**; received links (URLs) are only logged.
 
-## Our Papers
+## Documentation
 
-* Alexander Heinrich, Matthias Hollick, Thomas Schneider, Milan Stute, and Christian Weinert. **PrivateDrop: Practical Privacy-Preserving Authentication for Apple AirDrop.** *30th USENIX Security Symposium (USENIX Security ’21)*, August 14–16, 2019, virtual Event. [Paper](https://www.usenix.org/conference/usenixsecurity21/presentation/heinrich) [Website](https://privatedrop.github.io) [Code](https://github.com/seemoo-lab/privatedrop)
-* Milan Stute, Sashank Narain, Alex Mariotto, Alexander Heinrich, David Kreitschmann, Guevara Noubir, and Matthias Hollick. **A Billion Open Interfaces for Eve and Mallory: MitM, DoS, and Tracking Attacks on iOS and macOS Through Apple Wireless Direct Link.** *28th USENIX Security Symposium (USENIX Security ’19)*, August 14–16, 2019, Santa Clara, CA, USA. [Paper](https://www.usenix.org/conference/usenixsecurity19/presentation/stute)
+* [docs/INSTALL.md](docs/INSTALL.md) – installation per OS, OWL setup
+* [docs/WINDOWS.md](docs/WINDOWS.md) – what works on Windows and how
+* [docs/PROTOCOL.md](docs/PROTOCOL.md) – how AirDrop/OpenDrop work, code layout
+* [CONTRIBUTING.md](CONTRIBUTING.md) – development setup and tests
 
+## Papers
 
-## Authors
+* Alexander Heinrich, Matthias Hollick, Thomas Schneider, Milan Stute, and Christian Weinert.
+  **PrivateDrop: Practical Privacy-Preserving Authentication for Apple AirDrop.**
+  *USENIX Security ’21.* [Paper](https://www.usenix.org/conference/usenixsecurity21/presentation/heinrich)
+* Milan Stute, Sashank Narain, Alex Mariotto, Alexander Heinrich, David Kreitschmann,
+  Guevara Noubir, and Matthias Hollick. **A Billion Open Interfaces for Eve and Mallory:
+  MitM, DoS, and Tracking Attacks on iOS and macOS Through Apple Wireless Direct Link.**
+  *USENIX Security ’19.* [Paper](https://www.usenix.org/conference/usenixsecurity19/presentation/stute)
 
-* **Milan Stute** ([email](mailto:mstute@seemoo.tu-darmstadt.de), [web](https://seemoo.de/mstute))
-* **Alexander Heinrich**
+## Authors and license
 
+Original authors: **Milan Stute** and **Alexander Heinrich** (Secure Mobile Networking Lab,
+TU Darmstadt). This fork keeps their work under the same license.
 
-## License
-
-OpenDrop is licensed under the [**GNU General Public License v3.0**](LICENSE).
+OpenDrop is experimental software, not affiliated with or endorsed by Apple Inc.
+It is licensed under the [**GNU General Public License v3.0**](LICENSE).

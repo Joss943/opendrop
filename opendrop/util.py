@@ -19,188 +19,326 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import io
 import ipaddress
+import logging
+import mimetypes
 import os
+import platform
+import socket
+from dataclasses import dataclass
+from typing import Optional
 
 import ifaddr
-from libarchive.entry import ArchiveEntry, new_archive_entry
-from libarchive.ffi import (  # pylint: disable=no-name-in-module
-    ARCHIVE_EOF,
-    entry_clear,
-    entry_sourcepath,
-    read_disk_descend,
-    read_next_header2,
-    write_data,
-    write_finish_entry,
-    write_get_bytes_per_block,
-    write_header,
-)
-from libarchive.write import ArchiveWrite, new_archive_read_disk
-from PIL import ExifTags, Image
+
+logger = logging.getLogger(__name__)
+
+# Extension -> Apple Uniform Type Identifier. Anything unknown falls back to a
+# generic UTI derived from the MIME type.
+_UTI_BY_EXTENSION = {
+    ".jpg": "public.jpeg",
+    ".jpeg": "public.jpeg",
+    ".jp2": "public.jpeg-2000",
+    ".png": "public.png",
+    ".gif": "com.compuserve.gif",
+    ".heic": "public.heic",
+    ".heif": "public.heif",
+    ".tif": "public.tiff",
+    ".tiff": "public.tiff",
+    ".bmp": "com.microsoft.bmp",
+    ".webp": "org.webmproject.webp",
+    ".dng": "com.adobe.raw-image",
+    ".cr2": "com.canon.cr2-raw-image",
+    ".nef": "com.nikon.raw-image",
+    ".mov": "com.apple.quicktime-movie",
+    ".mp4": "public.mpeg-4",
+    ".m4v": "com.apple.m4v-video",
+    ".mp3": "public.mp3",
+    ".m4a": "com.apple.m4a-audio",
+    ".wav": "com.microsoft.waveform-audio",
+    ".aac": "public.aac-audio",
+    ".pdf": "com.adobe.pdf",
+    ".txt": "public.plain-text",
+    ".rtf": "public.rtf",
+    ".html": "public.html",
+    ".htm": "public.html",
+    ".csv": "public.comma-separated-values-text",
+    ".json": "public.json",
+    ".zip": "public.zip-archive",
+    ".gz": "org.gnu.gnu-zip-archive",
+    ".tar": "public.tar-archive",
+    ".vcf": "public.vcard",
+    ".ics": "com.apple.ical.ics",
+    ".doc": "com.microsoft.word.doc",
+    ".docx": "org.openxmlformats.wordprocessingml.document",
+    ".xls": "com.microsoft.excel.xls",
+    ".xlsx": "org.openxmlformats.spreadsheetml.sheet",
+    ".ppt": "com.microsoft.powerpoint.ppt",
+    ".pptx": "org.openxmlformats.presentationml.presentation",
+    ".key": "com.apple.keynote.key",
+    ".pages": "com.apple.iwork.pages.pages",
+    ".numbers": "com.apple.iwork.numbers.numbers",
+}
+
+# Magic bytes -> UTI, used when the file has no (known) extension
+_UTI_BY_MAGIC = [
+    (b"\xff\xd8\xff", "public.jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "public.png"),
+    (b"GIF8", "com.compuserve.gif"),
+    (b"%PDF", "com.adobe.pdf"),
+    (b"PK\x03\x04", "public.zip-archive"),
+    (b"\x1f\x8b", "org.gnu.gnu-zip-archive"),
+]
+
+
+@dataclass
+class InterfaceInfo:
+    """A network interface together with the addresses OpenDrop cares about."""
+
+    name: str
+    nice_name: str
+    index: Optional[int]
+    ipv6: Optional[ipaddress.IPv6Address]
+    ipv4: Optional[ipaddress.IPv4Address]
+
+    @property
+    def address(self):
+        """Address used for AirDrop: IPv6 (as Apple does), else IPv4 (LAN mode)."""
+        return self.ipv6 if self.ipv6 is not None else self.ipv4
+
+    @property
+    def display_name(self):
+        if self.nice_name and self.nice_name != self.name:
+            return f"{self.nice_name} ({self.name})"
+        return self.name
+
+
+def list_interfaces() -> list[InterfaceInfo]:
+    """
+    List all network interfaces on this machine.
+
+    On Windows, interface names are GUIDs; the human-readable name (e.g.
+    ``Wi-Fi``) is available as ``nice_name``.
+    """
+    result = []
+    for adapter in ifaddr.get_adapters():
+        v6_link_local = v6_other = v4 = None
+        scope = None
+        for ip in adapter.ips:
+            if ip.is_IPv6:
+                addr_str, _flowinfo, scope_id = ip.ip
+                addr = ipaddress.IPv6Address(addr_str.split("%")[0])
+                if addr.is_link_local and v6_link_local is None:
+                    v6_link_local, scope = addr, scope_id
+                elif v6_other is None:
+                    v6_other = addr
+                    scope = scope if scope is not None else scope_id
+            elif ip.is_IPv4 and v4 is None:
+                v4 = ipaddress.IPv4Address(ip.ip)
+
+        index = getattr(adapter, "index", None)
+        if index is None:
+            index = scope or _if_nametoindex(adapter.name)
+        result.append(
+            InterfaceInfo(
+                name=str(adapter.name),
+                nice_name=str(adapter.nice_name),
+                index=index,
+                ipv6=v6_link_local or v6_other,
+                ipv4=v4,
+            )
+        )
+    return result
+
+
+def _if_nametoindex(name):
+    try:
+        return socket.if_nametoindex(name)
+    except (OSError, AttributeError):
+        return None
+
+
+def find_interface(name) -> Optional[InterfaceInfo]:
+    """Look up an interface by its system name, friendly name or index."""
+    if name is None:
+        return None
+    interfaces = list_interfaces()
+    for iface in interfaces:
+        if iface.name == name:
+            return iface
+    for iface in interfaces:
+        if iface.nice_name == name:
+            return iface
+    lowered = str(name).lower()
+    for iface in interfaces:
+        if iface.nice_name.lower() == lowered or iface.name.lower() == lowered:
+            return iface
+    if str(name).isdigit():
+        for iface in interfaces:
+            if iface.index == int(name):
+                return iface
+    return None
+
+
+def default_interface_name():
+    """AWDL interface name; ``awdl0`` on macOS and on Linux with OWL."""
+    return "awdl0"
+
+
+def is_awdl(interface_name):
+    return str(interface_name).startswith("awdl")
+
+
+def is_macos():
+    return platform.system() == "Darwin"
+
+
+def get_uti_type(path) -> str:
+    """Return the Apple Uniform Type Identifier that best matches ``path``."""
+    if os.path.isdir(path):
+        return "public.folder"
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _UTI_BY_EXTENSION:
+        return _UTI_BY_EXTENSION[ext]
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        for magic, uti in _UTI_BY_MAGIC:
+            if head.startswith(magic):
+                return uti
+    except OSError:
+        pass
+    mime, _ = mimetypes.guess_type(path)
+    if mime:
+        major = mime.split("/")[0]
+        if major in ("image", "audio", "video"):
+            return f"public.{major}"
+        if major == "text":
+            return "public.text"
+    return "public.content"
+
+
+def is_image(path):
+    return get_uti_type(path) in (
+        "public.jpeg",
+        "public.jpeg-2000",
+        "public.png",
+        "com.compuserve.gif",
+        "public.tiff",
+        "com.microsoft.bmp",
+        "org.webmproject.webp",
+        "public.image",
+    )
+
+
+def generate_file_icon(file_path):
+    """
+    Generate a JPEG 2000 thumbnail of an image that is shown as preview on the
+    receiving device. Returns ``None`` if no thumbnail could be created.
+    """
+    try:
+        from PIL import Image, ImageOps  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        logger.debug("Pillow is not installed, not generating a preview")
+        return None
+
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:  # Pillow < 9.1
+        resample = Image.LANCZOS  # pylint: disable=no-member
+
+    try:
+        with Image.open(file_path) as im:
+            im = ImageOps.exif_transpose(im)
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.thumbnail((540, 540), resample)
+            buf = io.BytesIO()
+            try:
+                im.save(buf, format="JPEG2000")
+            except (OSError, KeyError):
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f"Could not create preview for {file_path}: {e}")
+        return None
+
+
+def write_debug(config, data, file_name):
+    """Dump raw protocol data to ``~/.opendrop/debug`` when ``--debug`` is set."""
+    if not config.debug:
+        return
+    os.makedirs(config.debug_dir, exist_ok=True)
+    debug_file_path = os.path.join(config.debug_dir, file_name)
+    with open(debug_file_path, "wb") as file:
+        if hasattr(data, "read"):
+            pos = data.tell()
+            file.write(data.read())
+            data.seek(pos)
+        else:  # assume bytes-like
+            file.write(data)
 
 
 class AirDropUtil:
-    """
-    This class contains a set of utility functions that support the opendrop implementation
-    They have been moved, because the opendrop files tend to get too long
-    """
+    """Backwards-compatible facade for code written against OpenDrop <= 0.13."""
 
-    @staticmethod
-    def get_uti_type(flp) -> str:
-        """
-        Get the Apple conform UTI Type from a flp instance which has been used on the data which should be sent
-
-        :param flp: fleep object
-        """
-
-        # Default UTI Type
-        uti_type = "public.content"
-        if len(flp.mime) == 0 or len(flp.type) == 0:
-            return uti_type
-
-        mime = flp.mime[0]
-        f_type = flp.type[0]
-        if "image" in mime:
-            uti_type = "public.image"
-
-            if "jpg" in mime:
-                uti_type = "public.jpeg"
-            elif "jp2" in mime:
-                uti_type = "public.jpeg-2000"
-            elif "gif" in mime:
-                uti_type = "com.compuserve.gif"
-            elif "png" in mime:
-                uti_type = "public.png"
-            elif "raw" in mime or "raw" in f_type:
-                uti_type = "public.camera-raw-image"
-        elif "audio" in f_type:
-            uti_type = "public.audio"
-        elif "video" in f_type:
-            uti_type = "public.video"
-        elif "archive" in f_type:
-            uti_type = "public.data"
-
-            if "gzip" in mime:
-                uti_type = "org.gnu.gnu-zip-archive"
-            if "zip" in mime:
-                uti_type = "public.zip-archive"
-
-        return uti_type
-
-    @staticmethod
-    def generate_file_icon(file_path):
-        """
-        Generates a small and a big thumbnail of an image
-        This will make it possible to preview the sent file
-
-        :param file_path: The path to the image
-        """
-        im = Image.open(file_path)
-
-        # rotate according to EXIF tags
-        try:
-            exif = dict(
-                (ExifTags.TAGS[k], v)
-                for k, v in im._getexif().items()  # pylint: disable=protected-access
-                if k in ExifTags.TAGS
-            )
-            angles = {3: 180, 6: 270, 8: 90}
-            orientation = exif["Orientation"]
-            if orientation in angles.keys():
-                im = im.rotate(angles[orientation], expand=True)
-        except (AttributeError, KeyError):
-            pass  # no EXIF data available
-
-        # Big image
-        im.thumbnail((540, 540), Image.ANTIALIAS)
-        img_bytes = io.BytesIO()
-        im.save(img_bytes, format="JPEG2000")
-        file_icon = img_bytes.getvalue()
-
-        # Small image
-        # im.thumbnail((64, 64), Image.ANTIALIAS)
-        # img_bytes = io.BytesIO()
-        # im.save(img_bytes, format='JPEG2000')
-        # small_file_icon = img_bytes.getvalue()
-
-        return file_icon
+    get_uti_type = staticmethod(get_uti_type)
+    generate_file_icon = staticmethod(generate_file_icon)
+    write_debug = staticmethod(write_debug)
 
     @staticmethod
     def get_ip_for_interface(interface_name, ipv6=False):
-        """
-        Get the ip address in IPv4 or IPv6 for a specific network interface
-
-        :param str interface_name: declares the network interface name for which the ip should be accessed
-        :param bool ipv6: Boolean indicating if the ipv6 address should be retrieved
-        :return: IPv4Address or IPv6Address object or None
-        """
-
-        def get_interface_by_name(name):
-            for interface in ifaddr.get_adapters():
-                if interface.name == name:
-                    return interface
+        iface = find_interface(interface_name)
+        if iface is None:
             return None
-
-        interface = get_interface_by_name(interface_name)
-        if interface is None:
-            return None
-
-        for ip in interface.ips:
-            if ip.is_IPv6 and ipv6:
-                return ipaddress.IPv6Address(
-                    ip.ip[0]
-                )  # first of (ip, flowinfo, scope_id) tuple
-            if ip.is_IPv4 and not ipv6:
-                return ipaddress.IPv4Address(ip.ip)
-
-        return None
-
-    @staticmethod
-    def write_debug(config, data, file_name):
-        if not config.debug:
-            return
-        if not os.path.exists(config.debug_dir):
-            os.makedirs(config.debug_dir)
-        debug_file_path = os.path.join(config.debug_dir, file_name)
-        with open(debug_file_path, "wb") as file:
-            if hasattr(data, "read"):
-                file.write(data.read())
-                data.seek(0)  # reset cursor position
-            else:  # assume bytes-like
-                file.write(data)
+        return iface.ipv6 if ipv6 else iface.ipv4
 
 
-class AbsArchiveWrite(ArchiveWrite):
-    def add_abs_file(self, path, store_path):
-        """
-        Read the given paths from disk and add them to the archive.
-        """
-        write_p = self._pointer
+class InterfaceError(RuntimeError):
+    """Raised when the requested network interface cannot be used."""
 
-        block_size = write_get_bytes_per_block(write_p)
-        if block_size <= 0:
-            block_size = 10240  # pragma: no cover
 
-        with new_archive_entry() as entry_p:
-            entry = ArchiveEntry(None, entry_p)
-            with new_archive_read_disk(path) as read_p:
-                while True:
-                    r = read_next_header2(read_p, entry_p)
-                    if r == ARCHIVE_EOF:
-                        break
-                    entry.pathname = store_path
-                    read_disk_descend(read_p)
-                    write_header(write_p, entry_p)
-                    try:
-                        with open(entry_sourcepath(entry_p), "rb") as f:
-                            while True:
-                                data = f.read(block_size)
-                                if not data:
-                                    break
-                                write_data(write_p, data, len(data))
-                    except IOError as e:
-                        if e.errno != 21:
-                            raise  # pragma: no cover
-                    write_finish_entry(write_p)
-                    entry_clear(entry_p)
-                    if os.path.isdir(path):
-                        break
+def _interface_hint(name):
+    system = platform.system()
+    if is_awdl(name):
+        if system == "Darwin":
+            return (
+                "On macOS, awdl0 only gets an address while AWDL is enabled. "
+                "Make sure Wi-Fi is turned on and AirDrop is not disabled."
+            )
+        if system == "Linux":
+            return "On Linux, start OWL first (https://github.com/seemoo-lab/owl)."
+        return (
+            "Windows has no AWDL support. Use `--interface` with a normal network "
+            "interface (e.g. -i Wi-Fi) to exchange files with other OpenDrop "
+            "peers on the same network, or see docs/WINDOWS.md."
+        )
+    return "Run `opendrop doctor` to list usable interfaces."
+
+
+def require_interface(name) -> InterfaceInfo:
+    """Like :func:`find_interface`, but raises a helpful error if unusable."""
+    iface = find_interface(name)
+    if iface is None:
+        raise InterfaceError(f"Interface {name!r} does not exist. {_interface_hint(name)}")
+    if iface.ipv6 is None and (is_awdl(name) or iface.ipv4 is None):
+        raise InterfaceError(
+            f"Interface {name!r} does not have an IPv6 address. {_interface_hint(name)}"
+        )
+    return iface
+
+
+def make_zeroconf(iface: InterfaceInfo, interface_name):
+    """Create a Zeroconf instance restricted to IPv6 on ``iface``."""
+    from zeroconf import IPVersion, Zeroconf  # pylint: disable=import-outside-toplevel
+
+    if iface.ipv6 is None:
+        # LAN mode on networks without IPv6 (only works between OpenDrop peers)
+        return Zeroconf(interfaces=[str(iface.ipv4)], ip_version=IPVersion.V4Only)
+    # Prefer the interface index: on Windows several adapters may share the
+    # same link-local address, so an address alone is ambiguous.
+    choice = iface.index if iface.index else str(iface.ipv6)
+    return Zeroconf(
+        interfaces=[choice],
+        ip_version=IPVersion.V6Only,
+        apple_p2p=is_macos() and is_awdl(interface_name),
+    )
