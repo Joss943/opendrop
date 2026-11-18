@@ -31,17 +31,21 @@ dependencies = [
 
 [project.optional-dependencies]
 libarchive = ["libarchive-c>=2.9"]
-dev = ["pytest>=7", "ruff>=0.5"]
+gui = ["PySide6>=6.5"]
+dev = ["pytest>=7", "ruff>=0.5", "pytest-qt>=4.2"]
 
 [project.scripts]
 opendrop = "opendrop.cli:main"
+
+[project.gui-scripts]
+opendrop-gui = "opendrop.gui:main"
 
 [project.urls]
 "Upstream" = "https://github.com/seemoo-lab/opendrop"
 "Research Paper" = "https://usenix.org/conference/usenixsecurity19/presentation/stute"
 
 [tool.setuptools]
-packages = ["opendrop"]
+packages = ["opendrop", "opendrop.gui"]
 
 [tool.setuptools.package-data]
 opendrop = ["certs/*.pem"]

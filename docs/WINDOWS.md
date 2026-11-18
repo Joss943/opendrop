@@ -1,5 +1,9 @@
 # OpenDrop on Windows
 
+> [!WARNING]
+> **Windows is not compatible with AirDrop.** iPhones, Macs and Android phones (Quick Share ↔ AirDrop)
+> cannot be reached from Windows. Only OpenDrop-to-OpenDrop transfers work.
+
 ## The short version
 
 * ✅ OpenDrop installs and runs on Windows (`pip install`, no native libraries).

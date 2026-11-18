@@ -342,3 +342,28 @@ def make_zeroconf(iface: InterfaceInfo, interface_name):
         ip_version=IPVersion.V6Only,
         apple_p2p=is_macos() and is_awdl(interface_name),
     )
+
+
+def suggest_interface():
+    """
+    Pick a sensible default interface for the desktop app: awdl0 when it is
+    usable (macOS, Linux with OWL), otherwise the interface that carries the
+    default route, otherwise the first interface with an address.
+    """
+    interfaces = [i for i in list_interfaces() if i.address is not None]
+    for iface in interfaces:
+        if is_awdl(iface.name) and iface.ipv6 is not None:
+            return iface.name
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # no packet is sent for UDP connect
+            local = ipaddress.IPv4Address(s.getsockname()[0])
+        for iface in interfaces:
+            if iface.ipv4 == local:
+                return iface.nice_name if iface.name.startswith("{") else iface.name
+    except OSError:
+        pass
+    for iface in interfaces:
+        if not (iface.address.is_loopback):
+            return iface.nice_name if iface.name.startswith("{") else iface.name
+    return default_interface_name()

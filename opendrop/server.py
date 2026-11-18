@@ -49,6 +49,8 @@ class TransferRequest:
     client_address: str
     files: list = field(default_factory=list)  # file names
     urls: list = field(default_factory=list)
+    file_types: list = field(default_factory=list)  # Apple UTIs
+    icon: bytes = None  # JPEG 2000 preview sent by the sender, if any
 
     @property
     def is_url(self):
@@ -101,6 +103,9 @@ class AirDropServer:
         self.zeroconf = None
         self.service_info = None
         self._serve_thread = None
+        # Optional ``listener(event, **data)`` for UIs. Events: "links",
+        # "upload_started", "upload_failed", "upload_done".
+        self.listener = None
         self.on_transfer_complete = None  # callback(list_of_paths)
 
         if announce:
@@ -207,6 +212,15 @@ class AirDropServer:
 
     def get_properties(self):
         return {b"flags": str(self.config.flags).encode("utf-8")}
+
+    def notify(self, event, **data):
+        if event == "upload_done" and self.on_transfer_complete is not None:
+            self.on_transfer_complete(data.get("paths", []))
+        if self.listener is not None:
+            try:
+                self.listener(event, **data)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(f"Listener failed for event {event}")
 
 
 class _ThreadingServerMixin(ThreadingMixIn):
@@ -392,14 +406,16 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         except (plistlib.InvalidFileException, ValueError):
             request = {}
 
+        files = [f for f in request.get("Files", []) if isinstance(f, dict)]
+        icon = request.get("FileIcon")
         transfer = TransferRequest(
             sender_name=str(request.get("SenderComputerName", "unknown sender")),
             sender_model=str(request.get("SenderModelName", "")),
             client_address=self.peer,
-            files=[
-                str(f.get("FileName", "?")) for f in request.get("Files", []) if isinstance(f, dict)
-            ],
+            files=[str(f.get("FileName", "?")) for f in files],
             urls=[str(u) for u in request.get("Items", [])],
+            file_types=[str(f.get("FileType", "")) for f in files],
+            icon=icon if isinstance(icon, (bytes, bytearray)) else None,
         )
         logger.info(f"Incoming request from {transfer.describe()}")
 
@@ -410,6 +426,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
 
         if transfer.is_url:
             self._store_links(transfer)
+            self._notify("links", transfer=transfer)
         else:
             self.server.sessions.allow(self.peer, transfer)
 
@@ -419,6 +436,11 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         }
         body = self._send_plist(ask_response)
         util.write_debug(self.config, body, "receive_ask_response.plist")
+
+    def _notify(self, event, **data):
+        owner = getattr(self.server, "airdrop_server", None)
+        if owner is not None:
+            owner.notify(event, **data)
 
     def _accept(self, transfer):
         callback = self.config.accept_callback
@@ -451,7 +473,8 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             self._send_empty(415, close=True)
             return
 
-        if self.server.sessions.consume(self.peer) is None:
+        transfer = self.server.sessions.consume(self.peer)
+        if transfer is None:
             logger.warning(f"Rejected upload from {self.peer} without an accepted /Ask")
             self._send_empty(403, close=True)
             return
@@ -473,6 +496,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             reader = _LimitedReader(self.rfile, length)
 
         logger.info("Receiving file(s) ...")
+        self._notify("upload_started", transfer=transfer)
         start = time.perf_counter()
         try:
             created = archive.extract_archive(
@@ -480,6 +504,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             )
         except (archive.ArchiveError, OSError, EOFError) as e:
             logger.error(f"Receiving failed: {e}")
+            self._notify("upload_failed", transfer=transfer, error=str(e))
             self._send_empty(400, close=True)
             return
 
@@ -490,10 +515,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             logger.info(f"  saved {path}")
 
         self._send_empty(200, close=True)
-
-        owner = getattr(self.server, "airdrop_server", None)
-        if owner is not None and owner.on_transfer_complete is not None:
-            owner.on_transfer_complete(created)
+        self._notify("upload_done", transfer=transfer, paths=created, size=reader.total)
 
     def do_POST(self):
         logger.debug(f"POST request at {self.path}")

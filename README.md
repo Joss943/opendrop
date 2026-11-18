@@ -2,30 +2,59 @@
 
 [![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
-*OpenDrop* is a command-line tool for sharing files between devices directly over Wi-Fi.
-It is protocol-compatible with Apple AirDrop, so it can exchange files with iPhones, iPads
-and Macs. It runs on **macOS, Linux and Windows**.
+*OpenDrop* shares files between devices directly over Wi-Fi. It is protocol-compatible with
+Apple AirDrop, so it can exchange files with iPhones, iPads, Macs and Android phones that
+support AirDrop through Quick Share. It comes as a **desktop app** and a command-line tool.
 
 > This is a maintained fork of [seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop)
-> (no longer maintained upstream). It fixes many bugs, removes the native dependencies
-> (`libarchive`, `openssl`) and adds Windows support. See [CHANGELOG.md](CHANGELOG.md).
+> (no longer maintained upstream). See [CHANGELOG.md](CHANGELOG.md).
 >
 > 🇫🇷 [Lire en français](README.fr.md)
 
+> [!WARNING]
+> **Windows is not compatible with AirDrop.** AirDrop needs Apple Wireless Direct Link
+> (AWDL), and Windows has no AWDL driver, so a Windows PC **cannot** exchange files with
+> iPhones, Macs or Android phones over AirDrop. On Windows, OpenDrop only works with other
+> computers running OpenDrop on the same network.
+
 ## What works where
 
-AirDrop only runs over Apple Wireless Direct Link (**AWDL**), a proprietary Wi-Fi link layer.
-Whether you can talk to Apple devices therefore depends on your OS:
+| Platform | iPhone / iPad / Mac | Android (Quick Share ↔ AirDrop) | Other OpenDrop computers |
+|----------|---------------------|---------------------------------|--------------------------|
+| **macOS** | ✅ Native, via `awdl0` | ✅ in theory, untested | ✅ |
+| **Linux** | ✅ With [OWL](https://github.com/seemoo-lab/owl) (Wi-Fi card with monitor mode) | ✅ in theory with OWL, untested | ✅ |
+| **Windows** | ❌ **Not compatible** (no AWDL) | ❌ **Not compatible** (no AWDL) | ✅ Over the normal network |
 
-| Platform | With Apple devices (iPhone, Mac…) | With other OpenDrop peers |
-|----------|-----------------------------------|---------------------------|
-| **macOS** | ✅ Native, via `awdl0` | ✅ |
-| **Linux** | ✅ With [OWL](https://github.com/seemoo-lab/owl) (needs a Wi-Fi card with monitor mode) | ✅ |
-| **Windows** | ⚠️ Not natively (no AWDL on Windows). Experimental via WSL2 + USB Wi-Fi + OWL, see [docs/WINDOWS.md](docs/WINDOWS.md) | ✅ Over any network interface (`-i Wi-Fi`) |
+**Android:** Google added AirDrop interoperability to Quick Share in late 2025, starting with
+the Pixel 10, then the Pixel 9 and some Samsung Galaxy phones in 2026. Set Quick Share to
+*Everyone*; like iPhones, these phones need AWDL on the computer side. This has not been
+tested with OpenDrop yet.
 
-"OpenDrop peers" mode uses a normal network (Wi-Fi/Ethernet) instead of AWDL: any
-OpenDrop on macOS, Linux or Windows on the same network can find each other and exchange
-files, using the AirDrop protocol.
+**Hackintosh:** OpenDrop uses the `awdl0` interface that macOS creates. If AirDrop does not
+work on a Hackintosh because its Wi-Fi card/driver has no AWDL support (e.g. most Intel cards),
+`awdl0` does not work either and OpenDrop cannot fix that.
+
+"OpenDrop computers" mode uses a normal network (Wi-Fi/Ethernet) instead of AWDL, so
+OpenDrop on macOS, Linux or Windows on the same network can exchange files with each other.
+
+## Desktop app
+
+```bash
+pip install "opendrop[gui] @ git+https://github.com/Joss943/opendrop.git"
+opendrop gui        # or: opendrop-gui
+```
+
+Ready-to-run builds (no Python needed) are produced by the *Desktop app* workflow in the
+Actions tab, and attached to GitHub releases.
+
+* **Send:** nearby devices appear as icons; drop files on a device, or use the buttons to
+  send files, folders or a link. Progress is shown for every transfer.
+* **Incoming transfers:** a window shows who is sending what, with the photo preview sent by
+  iPhones, and lets you **Accept** or **Decline** (auto-declines after 60 s). Auto-accept can
+  be enabled in the settings.
+* **Received:** history of received files and links; double-click to open.
+* **Settings:** name shown to others, network interface, download folder.
+* Runs in the system tray with notifications; available in English and French.
 
 Run `opendrop doctor` to check your setup.
 

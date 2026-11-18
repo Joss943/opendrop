@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.0 – desktop app
+
+* **Desktop app** (Qt/PySide6): `opendrop gui` or `opendrop-gui`, installed with
+  `pip install "opendrop[gui]"`. Nearby devices, drag-and-drop sending with progress,
+  accept/decline window with the photo preview sent by iPhones, received-files history,
+  settings, system tray and notifications, English and French.
+* Standalone builds for Windows, macOS and Linux (PyInstaller) in the *Desktop app*
+  workflow; attached to GitHub releases for `v*` tags.
+* `opendrop.engine.Engine`: background service (receiver, discovery, send jobs, history)
+  publishing events, reusable by any UI. Receivers can now be added by IP address when mDNS
+  is blocked.
+* Receiver events (`listener`) and richer `TransferRequest` (file types, preview).
+* The interface is chosen automatically in the app (`awdl0` when available).
+* Documentation: Windows is explicitly **not compatible with AirDrop** (no AWDL); notes on
+  Android (Quick Share ↔ AirDrop) and Hackintosh.
+
 ## 0.15.0
 
 ### Security

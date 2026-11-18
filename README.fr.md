@@ -2,11 +2,34 @@
 
 *OpenDrop* est un outil en ligne de commande pour partager des fichiers directement en Wi-Fi.
 Il parle le protocole AirDrop d'Apple : il peut donc échanger des fichiers avec des iPhone,
-iPad et Mac. Il fonctionne sous **macOS, Linux et Windows**.
+iPad et Mac. Il existe en **application de bureau** et en ligne de commande.
 
 Fork maintenu de [seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop) : nombreux bugs
-corrigés, plus aucune dépendance native (`libarchive`, `openssl`), support de Windows.
+corrigés, plus aucune dépendance native (`libarchive`, `openssl`).
 Détails dans le [CHANGELOG.md](CHANGELOG.md). Documentation complète en anglais : [README.md](README.md).
+
+> [!WARNING]
+> **Windows n'est pas compatible avec AirDrop.** AirDrop a besoin d'AWDL, le Wi-Fi direct
+> d'Apple, et Windows n'a aucun pilote AWDL : un PC Windows **ne peut pas** échanger de
+> fichiers en AirDrop avec un iPhone, un Mac ou un téléphone Android. Sous Windows, OpenDrop
+> fonctionne uniquement avec d'autres ordinateurs OpenDrop sur le même réseau.
+
+## Application de bureau
+
+```bash
+pip install "opendrop[gui] @ git+https://github.com/Joss943/opendrop.git"
+opendrop gui
+```
+
+Appareils à proximité, glisser-déposer pour envoyer, fenêtre « Accepter / Refuser » avec
+l'aperçu des photos envoyées par l'iPhone, historique des fichiers reçus, icône dans la barre
+des tâches et notifications. Des versions prêtes à lancer (sans Python) sont générées par le
+workflow *Desktop app* de GitHub Actions.
+
+**Android :** les Pixel 9/10 et certains Galaxy compatibles Quick Share ↔ AirDrop, réglés sur
+« Tout le monde », devraient pouvoir échanger avec OpenDrop sur macOS ou Linux + OWL (non testé).
+**Hackintosh :** si AirDrop ne marche pas parce que la carte Wi-Fi n'a pas d'AWDL, OpenDrop ne
+marchera pas non plus.
 
 ## Ce qui marche, et où
 
@@ -16,7 +39,7 @@ AirDrop passe exclusivement par **AWDL**, une couche Wi-Fi propriétaire d'Apple
 |---------|--------------------------|---------------------|
 | **macOS** | ✅ en natif (`awdl0`) | ✅ |
 | **Linux** | ✅ avec [OWL](https://github.com/seemoo-lab/owl) (carte Wi-Fi compatible mode moniteur) | ✅ |
-| **Windows** | ⚠️ pas en natif (Windows n'a pas d'AWDL) ; expérimental via WSL2 + clé USB Wi-Fi + OWL, voir [docs/WINDOWS.md](docs/WINDOWS.md) | ✅ sur n'importe quelle interface (`-i Wi-Fi`) |
+| **Windows** | ❌ **non compatible** (pas d'AWDL) | ✅ sur le réseau normal (`-i Wi-Fi`) |
 
 Lancez `opendrop doctor` pour vérifier votre configuration.
 

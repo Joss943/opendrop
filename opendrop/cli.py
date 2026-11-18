@@ -215,6 +215,7 @@ def build_parser():
     p_send.add_argument("--no-progress", action="store_true", help="hide the progress bar")
 
     sub.add_parser("doctor", parents=[common], help="check whether this system can run OpenDrop")
+    sub.add_parser("gui", help="open the desktop app (needs: pip install opendrop[gui])")
     return parser
 
 
@@ -241,6 +242,16 @@ class AirDropCli:
         self.lock = threading.Lock()
         self.found_event = threading.Event()
         self.wanted_receiver = None
+
+        if args.action == "gui":
+            try:
+                from .gui import main as gui_main  # pylint: disable=import-outside-toplevel
+
+                self.exit_code = gui_main([])
+            except ImportError:
+                logger.error("The desktop app needs PySide6: pip install 'opendrop[gui]'")
+                self.exit_code = EXIT_ERROR
+            return
 
         if args.action == "doctor":
             from .doctor import run_doctor  # pylint: disable=import-outside-toplevel
