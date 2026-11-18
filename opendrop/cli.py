@@ -29,6 +29,7 @@ import threading
 import time
 
 from . import __version__, util
+from .server import LINKS_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +60,65 @@ def _make_console_unicode_safe():
             pass
 
 
-def _wait_forever(timeout=None):
+def _wait_forever(timeout=None, stop_event=None):
     """
-    Sleep until Ctrl+C (or ``timeout`` seconds). A bare ``Event().wait()``
-    cannot be interrupted by Ctrl+C on Windows, so wait in short slices.
+    Sleep until Ctrl+C, ``timeout`` seconds or ``stop_event`` is set. A bare
+    ``Event().wait()`` cannot be interrupted by Ctrl+C on Windows, so wait in
+    short slices.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    event = threading.Event()
+    event = stop_event or threading.Event()
     while deadline is None or time.monotonic() < deadline:
-        event.wait(0.25)
+        if event.wait(0.25):
+            return
+
+
+_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_size(text):
+    """Parse sizes such as ``500M``, ``2G``, ``1.5GB`` or ``1024``."""
+    value = str(text).strip().upper().removesuffix("IB").removesuffix("B")
+    unit = value[-1] if value and value[-1] in _UNITS else ""
+    number = value[: -len(unit)] if unit else value
+    try:
+        size = int(float(number) * _UNITS[unit])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid size: {text!r}") from None
+    if size <= 0:
+        raise argparse.ArgumentTypeError("size must be positive")
+    return size
+
+
+def _confirm_prompt(transfer, _lock=threading.Lock()):  # noqa: B008
+    """Ask on the terminal whether to accept a transfer (one prompt at a time)."""
+    with _lock:
+        print(f"\n{transfer.describe()}", flush=True)
+        try:
+            answer = input("Accept? [y/N] ")
+        except EOFError:
+            return False
+        return answer.strip().lower() in ("y", "yes", "o", "oui")
+
+
+class _Progress:
+    """Minimal progress bar on stderr (only when it is a terminal)."""
+
+    def __init__(self, enabled):
+        self.enabled = enabled and sys.stderr.isatty()
+        self._last = -1
+
+    def __call__(self, done, total):
+        if not self.enabled or total <= 0:
+            return
+        pct = int(done * 100 / total)
+        if pct != self._last:
+            self._last = pct
+            bar = "#" * (pct // 4)
+            sys.stderr.write(f"\r[{bar:<25}] {pct:3d}%  {done / 1048576:.1f} MB")
+            if done >= total:
+                sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def build_parser():
@@ -108,6 +159,27 @@ def build_parser():
         help="directory where received files are stored (default: current directory)",
     )
     p_receive.add_argument("--port", type=int, default=8771, help="HTTPS port (default 8771)")
+    p_receive.add_argument(
+        "-c",
+        "--confirm",
+        action="store_true",
+        help="ask on the terminal before accepting each transfer",
+    )
+    p_receive.add_argument(
+        "--max-size",
+        type=parse_size,
+        default=None,
+        metavar="SIZE",
+        help="refuse transfers larger than SIZE (e.g. 500M, 2G)",
+    )
+    p_receive.add_argument(
+        "--once", action="store_true", help="exit after the first successful transfer"
+    )
+    p_receive.add_argument(
+        "--no-save-links",
+        action="store_true",
+        help=f"do not append received links to {LINKS_FILE}",
+    )
 
     p_find = sub.add_parser("find", parents=[common], help="discover receivers nearby")
     p_find.add_argument(
@@ -116,6 +188,9 @@ def build_parser():
         type=float,
         default=None,
         help="stop after this many seconds (default: run until Ctrl+C)",
+    )
+    p_find.add_argument(
+        "--json", action="store_true", help="print each receiver as a JSON line on stdout"
     )
 
     p_send = sub.add_parser("send", parents=[common], help="send file(s) or a link")
@@ -129,6 +204,15 @@ def build_parser():
         required=True,
         help="peer to send to (index, ID, or name from `opendrop find`)",
     )
+    p_send.add_argument(
+        "-s",
+        "--scan",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="look for the receiver for up to SECONDS first (no separate `find` needed)",
+    )
+    p_send.add_argument("--no-progress", action="store_true", help="hide the progress bar")
 
     sub.add_parser("doctor", parents=[common], help="check whether this system can run OpenDrop")
     return parser
@@ -155,11 +239,13 @@ class AirDropCli:
         self.browser = None
         self.discover = []
         self.lock = threading.Lock()
+        self.found_event = threading.Event()
+        self.wanted_receiver = None
 
         if args.action == "doctor":
             from .doctor import run_doctor  # pylint: disable=import-outside-toplevel
 
-            self.exit_code = run_doctor(args.interface)
+            self.exit_code = run_doctor(args.interface, args.config_dir)
             return
 
         if args.action == "send":
@@ -175,6 +261,9 @@ class AirDropCli:
             self.is_url = args.url
             self.receiver = args.receiver
 
+        if args.action == "receive" and args.confirm and not sys.stdin.isatty():
+            parser.error("--confirm needs an interactive terminal")
+
         from .config import AirDropConfig  # pylint: disable=import-outside-toplevel
 
         self.config = AirDropConfig(
@@ -187,6 +276,9 @@ class AirDropCli:
             airdrop_dir=args.config_dir,
             receive_dir=getattr(args, "output", None),
             server_port=getattr(args, "port", 8771),
+            accept_callback=_confirm_prompt if getattr(args, "confirm", False) else None,
+            max_upload_size=getattr(args, "max_size", None),
+            save_links=not getattr(args, "no_save_links", False),
         )
 
         try:
@@ -211,11 +303,14 @@ class AirDropCli:
     def find(self, timeout=None):
         from .client import AirDropBrowser  # pylint: disable=import-outside-toplevel
 
-        logger.info("Looking for receivers. Press Ctrl+C to stop ...")
+        if not getattr(self.args, "json", False) and self.wanted_receiver is None:
+            logger.info("Looking for receivers. Press Ctrl+C to stop ...")
         self.browser = AirDropBrowser(self.config)
         self._write_report()  # start with an empty report
         self.browser.start(callback_add=self._found_receiver)
-        _wait_forever(timeout)
+        _wait_forever(timeout, self.found_event)
+        self.browser.stop()
+        self.browser = None
 
     def _found_receiver(self, info):
         thread = threading.Thread(target=self._send_discover, args=(info,), daemon=True)
@@ -270,10 +365,16 @@ class AirDropCli:
                 }
             )
             self._write_report()
-            if discoverable:
+            if getattr(self.args, "json", False):
+                print(json.dumps({"index": index, **self.discover[-1]}), flush=True)
+            elif discoverable:
                 logger.info(f"Found  index {index}  ID {identifier}  name {receiver_name}")
             else:
                 logger.debug(f"Receiver ID {identifier} is not discoverable")
+            if self.wanted_receiver is not None and resolve_receiver(
+                self.discover, self.wanted_receiver, quiet=True
+            ):
+                self.found_event.set()
 
     def _write_report(self):
         """Persist results after every find so nothing is lost on a hard kill."""
@@ -288,6 +389,15 @@ class AirDropCli:
         from .server import AirDropServer  # pylint: disable=import-outside-toplevel
 
         self.server = AirDropServer(self.config)
+        if self.args.once:
+
+            def _done(_paths):
+                # shutdown() must not run in the thread that serves the request
+                threading.Thread(target=self.server.http_server.shutdown, daemon=True).start()
+
+            self.server.on_transfer_complete = _done
+        if self.config.accept_callback is None:
+            logger.info("All incoming transfers are accepted (use --confirm to be asked).")
         self.server.start_service()
         logger.info("Press Ctrl+C to stop.")
         self.server.start_server()
@@ -297,7 +407,13 @@ class AirDropCli:
     def send(self):
         from .client import AirDropClient  # pylint: disable=import-outside-toplevel
 
-        info = self._get_receiver_info()
+        if self.args.scan > 0:
+            logger.info(f"Looking for {self.receiver!r} (up to {self.args.scan:g} s) ...")
+            self.wanted_receiver = self.receiver
+            self.find(self.args.scan)
+            info = resolve_receiver(self.discover, self.receiver)
+        else:
+            info = self._get_receiver_info()
         if info is None:
             return EXIT_ERROR
         self.client = AirDropClient(self.config, (info["address"], info["port"]))
@@ -310,7 +426,8 @@ class AirDropCli:
             if self.is_url:
                 return EXIT_OK
             logger.info("Uploading file(s) ...")
-            if not self.client.send_upload(self.file):
+            progress = _Progress(not self.args.no_progress)
+            if not self.client.send_upload(self.file, progress=progress):
                 logger.error("Uploading has failed")
                 return EXIT_ERROR
         except (
@@ -343,7 +460,7 @@ class AirDropCli:
         return resolve_receiver(infos, self.receiver)
 
 
-def resolve_receiver(infos, receiver):
+def resolve_receiver(infos, receiver, quiet=False):
     """
     Find a receiver in the discovery report by (1) index, (2) ID, (3) name.
     """
@@ -360,7 +477,8 @@ def resolve_receiver(infos, receiver):
     for info in infos:
         if (info.get("name") or "").casefold() == lowered:
             return info
-    logger.error(
-        "Receiver does not exist (check -r,--receiver format or try 'opendrop find' again)"
-    )
+    if not quiet:
+        logger.error(
+            "Receiver does not exist (check -r,--receiver format or try 'opendrop find' again)"
+        )
     return None

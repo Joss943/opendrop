@@ -45,7 +45,10 @@ cd opendrop
 pip install .
 ```
 
-On Windows, use `py -m pip install .` if `pip` is not on your `PATH`.
+Recommended: install it as an isolated command-line app with [pipx](https://pipx.pypa.io):
+`pipx install git+https://github.com/Joss943/opendrop.git`
+
+On Windows, use `py -m pip install .` if `pip` is not on your `PATH`; `py -m opendrop` always works.
 Platform-specific notes: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Usage
@@ -73,7 +76,8 @@ Found  index 0  ID eccb2f2dcfe7  name John’s iPhone
 Found  index 1  ID e63138ac6ba8  name Jane’s MacBook Pro
 ```
 
-Use `-t 10` to stop automatically after 10 seconds (handy in scripts).
+Use `-t 10` to stop automatically after 10 seconds, and `--json` to get one JSON object per
+receiver on stdout (handy in scripts).
 Results are saved to `~/.opendrop/discover.last.json` as soon as they are found.
 
 ### Send files, folders or a link
@@ -89,18 +93,43 @@ Uploading has been successful
 * `-r` accepts the **index**, the **ID** or the **name** (case-insensitive) from `find`.
 * `-f` accepts **several files and folders**: `opendrop send -r 0 -f a.pdf b.jpg Photos/`
 * Send a web link with `--url`: `opendrop send -r 0 -f https://example.org --url`
+* **One step, no separate `find`:** `opendrop send --scan 10 -r "Jane’s MacBook Pro" -f a.pdf`
+  looks for that receiver for up to 10 seconds and sends as soon as it shows up.
+* A progress bar is shown while uploading (`--no-progress` to hide it).
 
 Exit codes: `0` success, `1` error, `2` declined by the receiver.
 
 ### Receive files
 
 ```console
-$ opendrop receive -o ~/Downloads/AirDrop
+$ opendrop receive -o ~/Downloads/AirDrop --confirm
+Incoming request from Jane’s MacBook Pro: holiday.jpg
+Accept? [y/N] y
 ```
 
-All incoming transfers are accepted automatically and stored in the `-o` directory
-(default: current directory). Existing files are never overwritten (`photo (1).jpg` is used
-instead), and malicious archives cannot write outside that directory.
+| Option | Meaning |
+|--------|---------|
+| `-o, --output DIR` | Where to store received files (default: current directory) |
+| `-c, --confirm` | Ask before accepting each transfer (otherwise everything is accepted) |
+| `--max-size SIZE` | Refuse transfers bigger than `SIZE`, e.g. `500M`, `2G` |
+| `--once` | Exit after the first successful transfer |
+| `--no-save-links` | Received links are normally appended to `received_links.txt` |
+| `--port` | HTTPS port (default 8771, the next free one is used if busy) |
+
+## Security
+
+The receiver is hardened against malicious senders:
+
+* files can only be uploaded right after an **accepted** `/Ask` from the same peer;
+* archives cannot write outside the output directory (`..`, absolute paths, symlinks,
+  devices are refused), never overwrite existing files and never leave partial files behind;
+* optional confirmation (`--confirm`) and size limit (`--max-size`); free disk space is checked;
+* idle connections time out after 60 s, at most 16 connections are served at once, and the
+  TLS handshake no longer blocks other clients;
+* received links are only saved to a text file, never opened automatically.
+
+There is still **no peer authentication** (see Limitations): with `--confirm` off, anyone in
+radio range can send you files. Use `--confirm` on untrusted networks.
 
 ### Between two computers without AWDL
 
@@ -128,7 +157,8 @@ OpenDrop never overwrites certificates that are not its own self-signed ones.
   usually helps.
 * **No peer authentication.** OpenDrop does not verify that the TLS certificate is signed by
   Apple or that the validation record is valid.
-* **Receivers accept everything automatically**; received links (URLs) are only logged.
+* Receivers accept everything automatically unless `--confirm` is used.
+* HEIC/Live Photos are not requested: Apple senders convert them to JPEG for OpenDrop.
 
 ## Documentation
 

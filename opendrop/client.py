@@ -211,9 +211,11 @@ class AirDropClient:
         success, _ = self.send_POST("/Ask", ask_binary, timeout=self.config.ask_timeout)
         return success
 
-    def send_upload(self, file_path, is_url=False):
+    def send_upload(self, file_path, is_url=False, progress=None):
         """
         Send file(s) to a receiver as a gzip-compressed CPIO archive.
+
+        :param progress: optional ``callback(bytes_sent, bytes_total)``
         """
         # Don't send an upload request if we just sent a link
         if is_url:
@@ -227,11 +229,13 @@ class AirDropClient:
         # that large files do not have to fit into RAM.
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as stream:
             archive.write_archive(stream, [os.fspath(p) for p in paths])
+            total = stream.tell()
             stream.seek(0)
+            body = _ProgressReader(stream, total, progress) if progress else stream
             # No Content-Length -> http.client uses chunked transfer encoding,
             # which is what AirDrop receivers expect.
             success, _ = self.send_POST(
-                "/Upload", stream, headers=headers, timeout=max(self.config.timeout, 60)
+                "/Upload", body, headers=headers, timeout=max(self.config.timeout, 60)
             )
         return success
 
@@ -248,6 +252,26 @@ class AirDropClient:
             "Accept-Language": "en-us",
             "Accept-Encoding": "br, gzip, deflate",
         }
+
+
+class _ProgressReader:
+    """File wrapper that reports how much of the body has been read."""
+
+    def __init__(self, fileobj, total, callback):
+        self._f = fileobj
+        self._total = total
+        self._callback = callback
+
+    def read(self, size=-1):
+        data = self._f.read(size)
+        self._callback(self._f.tell(), self._total)
+        return data
+
+    def tell(self):
+        return self._f.tell()
+
+    def seek(self, *args):
+        return self._f.seek(*args)
 
 
 class HTTPSConnectionAWDL(HTTPSConnection):

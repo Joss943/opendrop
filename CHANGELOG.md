@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.15.0
+
+### Security
+* Uploads are only accepted right after an accepted `/Ask` from the same peer (previously
+  anyone could push files straight to `/Upload`).
+* Optional interactive confirmation: `receive --confirm`.
+* Size limits: `receive --max-size 2G`, a cap on the number of archive entries, and a free
+  disk space check. Partially written files are deleted when a transfer fails.
+* Slow or idle clients can no longer freeze the receiver: TLS handshakes happen in the
+  connection's own thread, idle connections time out after 60 s, and at most 16 connections
+  are served at once.
+* Key directory created with `0700` permissions.
+
+### Features
+* `send --scan SECONDS`: find the receiver and send in one command.
+* Upload progress bar (`--no-progress` to hide it).
+* `find --json`: machine-readable output.
+* `receive --once`: exit after the first transfer.
+* Received links are saved to `received_links.txt` (`--no-save-links` to disable).
+* `opendrop doctor` also checks the HTTPS port, the configuration directory and firewall hints.
+* Python API: `AirDropConfig(accept_callback=...)` receives a `TransferRequest`
+  (sender, files, URLs) to accept or decline.
+
+### Compatibility
+* Accept `Content-Type: application/x-cpio; …` with parameters.
+* Python 3.14 added to CI; Python 3.9 tested on Ubuntu 22.04 (no longer built for newer
+  Ubuntu images).
+* Accurate transfer speed on Windows (high-resolution timer).
+* `pipx` installation documented.
+
 ## 0.14.0 – maintained fork
 
 ### Platform support

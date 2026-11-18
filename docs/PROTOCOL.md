@@ -19,6 +19,19 @@
    * `POST /Upload` – the files as a gzip-compressed CPIO archive (`application/x-cpio`),
      sent with `Transfer-Encoding: chunked`.
 
+## Receiver state machine
+
+```
+/Discover ──► name returned (always)
+/Ask ──► accept_callback(TransferRequest)
+          ├─ declined ─► 403
+          ├─ URLs ─────► 200, links saved to received_links.txt
+          └─ files ────► 200, peer IP stored in SessionStore (10 min)
+/Upload ──► SessionStore.consume(peer IP)
+          ├─ none ─────► 403
+          └─ ok ───────► archive.extract_archive(max_bytes=…) ─► 200 / 400
+```
+
 ## Code layout
 
 | Module | Role |

@@ -20,10 +20,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import io
 import json
 import logging
+import os
 import plistlib
 import socket
+import ssl
 import threading
 import time
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -33,6 +36,53 @@ logger = logging.getLogger(__name__)
 
 SO_RECV_ANYIF = 0x1104  # macOS: allow traffic on the AWDL interface
 MAX_PLIST_SIZE = 16 * 1024 * 1024  # /Discover and /Ask bodies (incl. icons)
+REQUEST_TIMEOUT = 60  # seconds of inactivity before a connection is dropped
+LINKS_FILE = "received_links.txt"
+
+
+@dataclass
+class TransferRequest:
+    """What a sender asks us to accept in ``/Ask``."""
+
+    sender_name: str
+    sender_model: str
+    client_address: str
+    files: list = field(default_factory=list)  # file names
+    urls: list = field(default_factory=list)
+
+    @property
+    def is_url(self):
+        return bool(self.urls)
+
+    def describe(self):
+        items = self.urls if self.is_url else self.files
+        return f"{self.sender_name}: {', '.join(map(str, items)) or 'file(s)'}"
+
+
+class SessionStore:
+    """
+    Remembers which peers were allowed to upload after an accepted ``/Ask``.
+    Without this, anyone could skip ``/Ask`` and push files directly.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self._sessions = {}
+        self._lock = threading.Lock()
+
+    def allow(self, peer, request):
+        with self._lock:
+            self._sessions[peer] = (time.monotonic() + self.timeout, request)
+
+    def consume(self, peer):
+        now = time.monotonic()
+        with self._lock:
+            entry = self._sessions.pop(peer, None)
+            for key in [k for k, (exp, _) in self._sessions.items() if exp < now]:
+                del self._sessions[key]
+        if entry is None or entry[0] < now:
+            return None
+        return entry[1]
 
 
 class AirDropServer:
@@ -51,6 +101,7 @@ class AirDropServer:
         self.zeroconf = None
         self.service_info = None
         self._serve_thread = None
+        self.on_transfer_complete = None  # callback(list_of_paths)
 
         if announce:
             self.iface = util.require_interface(self.config.interface)
@@ -118,9 +169,14 @@ class AirDropServer:
             raise last_error
         self.config.port = httpd.server_address[1]
 
+        # The TLS handshake is done in the per-connection thread (see
+        # AirDropServerHandler.setup) so a slow client cannot block accept().
         httpd.socket = self.config.get_server_ssl_context().wrap_socket(
-            httpd.socket, server_side=True
+            httpd.socket, server_side=True, do_handshake_on_connect=False
         )
+        httpd.sessions = SessionStore(self.config.session_timeout)
+        httpd.connection_slots = threading.BoundedSemaphore(self.config.max_connections)
+        httpd.airdrop_server = self
         return httpd
 
     def start_server(self, blocking=True):
@@ -156,6 +212,23 @@ class AirDropServer:
 class _ThreadingServerMixin(ThreadingMixIn):
     daemon_threads = True
     allow_reuse_address = False
+    connection_slots = None
+
+    def process_request(self, request, client_address):
+        # Bound the number of simultaneous connections
+        slots = self.connection_slots
+        if slots is not None and not slots.acquire(blocking=False):
+            logger.warning(f"Too many connections, dropping {client_address[0]}")
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            if self.connection_slots is not None:
+                self.connection_slots.release()
 
     def handle_error(self, request, client_address):
         logger.debug(f"Error while handling request from {client_address}", exc_info=True)
@@ -230,6 +303,17 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
     config = None
+    timeout = REQUEST_TIMEOUT
+
+    def setup(self):
+        self.request.settimeout(self.timeout)
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.do_handshake()
+        super().setup()
+
+    @property
+    def peer(self):
+        return self.client_address[0]
 
     def _send_plist(self, payload):
         body = plistlib.dumps(payload, fmt=plistlib.FMT_BINARY)
@@ -303,15 +387,31 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
 
         try:
             request = plistlib.loads(post_data) if post_data else {}
+            if not isinstance(request, dict):
+                request = {}
         except (plistlib.InvalidFileException, ValueError):
             request = {}
-        sender = request.get("SenderComputerName", "unknown sender")
-        if "Items" in request:
-            logger.info(f"{sender} wants to send: {', '.join(map(str, request['Items']))}")
-            logger.info("(Receiving links is not supported; only files are saved.)")
+
+        transfer = TransferRequest(
+            sender_name=str(request.get("SenderComputerName", "unknown sender")),
+            sender_model=str(request.get("SenderModelName", "")),
+            client_address=self.peer,
+            files=[
+                str(f.get("FileName", "?")) for f in request.get("Files", []) if isinstance(f, dict)
+            ],
+            urls=[str(u) for u in request.get("Items", [])],
+        )
+        logger.info(f"Incoming request from {transfer.describe()}")
+
+        if not self._accept(transfer):
+            logger.info("Declined")
+            self._send_empty(403, close=True)
+            return
+
+        if transfer.is_url:
+            self._store_links(transfer)
         else:
-            names = [f.get("FileName", "?") for f in request.get("Files", [])]
-            logger.info(f"{sender} wants to send: {', '.join(names) or 'file(s)'}")
+            self.server.sessions.allow(self.peer, transfer)
 
         ask_response = {
             "ReceiverModelName": self.config.computer_model,
@@ -320,10 +420,40 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         body = self._send_plist(ask_response)
         util.write_debug(self.config, body, "receive_ask_response.plist")
 
+    def _accept(self, transfer):
+        callback = self.config.accept_callback
+        if callback is None:
+            return True
+        try:
+            return bool(callback(transfer))
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Accept callback failed; declining")
+            return False
+
+    def _store_links(self, transfer):
+        for url in transfer.urls:
+            logger.info(f"  link: {url}")
+        if not self.config.save_links:
+            return
+        os.makedirs(self.config.receive_dir, exist_ok=True)
+        path = os.path.join(self.config.receive_dir, LINKS_FILE)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with _links_lock, open(path, "a", encoding="utf-8") as f:
+            for url in transfer.urls:
+                clean = url.replace("\n", " ").replace("\r", " ")
+                f.write(f"{stamp}\t{transfer.sender_name}\t{clean}\n")
+        logger.info(f"  saved to {path}")
+
     def handle_upload(self):
-        if self.headers.get("Content-Type", "").lower() != "application/x-cpio":
+        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type != "application/x-cpio":
             logger.warning(f"Unsupported content-type: {self.headers.get('Content-Type')}")
             self._send_empty(415, close=True)
+            return
+
+        if self.server.sessions.consume(self.peer) is None:
+            logger.warning(f"Rejected upload from {self.peer} without an accepted /Ask")
+            self._send_empty(403, close=True)
             return
 
         # Note: 'Expect: 100-continue' is answered automatically by
@@ -343,21 +473,27 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             reader = _LimitedReader(self.rfile, length)
 
         logger.info("Receiving file(s) ...")
-        start = time.time()
+        start = time.perf_counter()
         try:
-            created = archive.extract_archive(reader, self.config.receive_dir)
+            created = archive.extract_archive(
+                reader, self.config.receive_dir, max_bytes=self.config.max_upload_size
+            )
         except (archive.ArchiveError, OSError, EOFError) as e:
             logger.error(f"Receiving failed: {e}")
             self._send_empty(400, close=True)
             return
 
         transferred = reader.total / 1024.0 / 1024.0
-        speed = transferred / max(time.time() - start, 1e-6)
+        speed = transferred / max(time.perf_counter() - start, 1e-3)
         logger.info(f"File(s) received (size {transferred:.02f} MB, speed {speed:.02f} MB/s)")
         for path in created:
             logger.info(f"  saved {path}")
 
         self._send_empty(200, close=True)
+
+        owner = getattr(self.server, "airdrop_server", None)
+        if owner is not None and owner.on_transfer_complete is not None:
+            owner.on_transfer_complete(created)
 
     def do_POST(self):
         logger.debug(f"POST request at {self.path}")
@@ -376,6 +512,9 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         logger.debug(
             f"{self.client_address[0]} - - [{self.log_date_time_string()}] {format % args}"
         )
+
+
+_links_lock = threading.Lock()
 
 
 class _LimitedReader(io.RawIOBase):

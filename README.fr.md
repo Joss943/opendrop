@@ -38,8 +38,22 @@ opendrop find -t 10                   # cherche les appareils pendant 10 s
 opendrop send -r 0 -f photo.jpg       # envoie au premier appareil trouvé
 opendrop send -r "iPhone de Jean" -f a.pdf b.jpg Dossier/   # plusieurs fichiers
 opendrop send -r 0 -f https://example.org --url             # envoie un lien
+opendrop send --scan 10 -r "MacBook de Julie" -f a.pdf      # cherche puis envoie, en une commande
 opendrop receive -o ~/Téléchargements # reçoit dans ce dossier
+opendrop receive --confirm --max-size 2G --once             # demande confirmation, 2 Go max, s'arrête après 1 transfert
+opendrop find --json -t 5                                   # résultats en JSON (scripts)
 ```
+
+Les liens reçus sont enregistrés dans `received_links.txt` (jamais ouverts automatiquement).
+
+## Sécurité
+
+* Un envoi n'est accepté qu'après une demande (`/Ask`) acceptée venant du même appareil.
+* Aucun fichier ne peut être écrit hors du dossier de réception ; rien n'est jamais écrasé ;
+  pas de fichier à moitié écrit en cas d'erreur ; l'espace disque est vérifié.
+* `--confirm` pour valider chaque transfert, `--max-size` pour limiter la taille.
+* Connexions inactives coupées après 60 s, 16 connexions simultanées au maximum.
+* Sur un réseau public, utilisez `--confirm` : sans lui, n'importe qui à portée peut vous envoyer des fichiers.
 
 Entre deux ordinateurs sans AWDL (par exemple un PC Windows et un PC Linux sur le même réseau) :
 
@@ -55,8 +69,6 @@ Codes de sortie de `send` : `0` succès, `1` erreur, `2` refusé par le destinat
 
 * Le réveil des appareils Apple par Bluetooth LE n'est pas implémenté : ouvrez le menu
   AirDrop sur l'iPhone/le Mac pour qu'il devienne visible.
-* Pas d'authentification des pairs ; en réception, tout est accepté automatiquement
-  (les fichiers existants ne sont jamais écrasés et aucun fichier ne peut être écrit hors du
-  dossier de réception).
+* Pas d'authentification des pairs ; sans `--confirm`, tout est accepté automatiquement.
 
 Licence : GNU GPL v3. Projet non affilié à Apple Inc.

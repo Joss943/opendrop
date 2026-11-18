@@ -81,3 +81,41 @@ def test_doctor_reports_missing_interface(capsys):
     c = cli.AirDropCli(["doctor", "-i", "does-not-exist"])
     assert c.exit_code == 1
     assert "does not exist" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("1024", 1024),
+        ("500M", 500 * 1024**2),
+        ("2G", 2 * 1024**3),
+        ("1.5GB", int(1.5 * 1024**3)),
+        ("10MiB", 10 * 1024**2),
+    ],
+)
+def test_parse_size(text, expected):
+    assert cli.parse_size(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "abc", "-5M", "0"])
+def test_parse_size_invalid(text):
+    with pytest.raises(Exception):  # noqa: B017
+        cli.parse_size(text)
+
+
+def test_receive_options_parsed():
+    args = cli.build_parser().parse_args(
+        ["receive", "--confirm", "--max-size", "1G", "--once", "-o", "out", "--no-save-links"]
+    )
+    assert args.confirm and args.once and args.no_save_links
+    assert args.max_size == 1024**3
+
+
+def test_send_scan_option():
+    args = cli.build_parser().parse_args(["send", "-r", "x", "-f", "a", "--scan", "5"])
+    assert args.scan == 5
+
+
+def test_resolve_receiver_quiet(caplog):
+    assert cli.resolve_receiver(INFOS, "nobody", quiet=True) is None
+    assert "does not exist" not in caplog.text

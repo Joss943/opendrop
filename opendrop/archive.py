@@ -34,6 +34,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import stat
 import time
 
@@ -278,7 +279,11 @@ def _decompressed(stream):
     return stream
 
 
-def extract_archive(stream, dest_dir):
+class LimitExceeded(ArchiveError):
+    """Raised when an archive exceeds the configured size or entry limits."""
+
+
+def extract_archive(stream, dest_dir, max_bytes=None, max_entries=100_000):
     """
     Safely extract a (possibly compressed) CPIO archive from ``stream`` into
     ``dest_dir``.
@@ -287,6 +292,8 @@ def extract_archive(stream, dest_dir):
     * Symbolic links, devices, FIFOs etc. are skipped.
     * Names that are invalid on the current OS are sanitized.
     * Existing files are never overwritten: a numbered name is used instead.
+    * ``max_bytes`` / ``max_entries`` limit the total amount of data and the
+      number of entries; free disk space is checked before writing each file.
 
     Returns the list of top-level paths that were created.
     """
@@ -300,10 +307,18 @@ def extract_archive(stream, dest_dir):
 
     renamed_roots = {}
     created = []
+    total_bytes = 0
+    entries = 0
     while True:
         entry, data_pad = _parse_header(stream)
         if entry.name == TRAILER:
             break
+        entries += 1
+        if max_entries is not None and entries > max_entries:
+            raise LimitExceeded(f"Archive contains more than {max_entries} entries")
+        total_bytes += entry.size
+        if max_bytes is not None and total_bytes > max_bytes:
+            raise LimitExceeded(f"Transfer exceeds the size limit of {max_bytes} bytes")
         parts = sanitize_member_path(entry.name)
         if parts is None or not (entry.is_file or entry.is_dir):
             logger.warning(f"Skipping unsafe or unsupported archive entry {entry.name!r}")
@@ -323,14 +338,24 @@ def extract_archive(stream, dest_dir):
             continue
 
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        if entry.size > 0 and shutil.disk_usage(dest_dir).free < entry.size + 16 * 1024 * 1024:
+            raise LimitExceeded(f"Not enough disk space for {entry.name!r}")
         remaining = entry.size
-        with open(target, "wb") as out:
-            while remaining > 0:
-                chunk = stream.read(min(remaining, _COPY_BUFSIZE))
-                if not chunk:
-                    raise ArchiveError("Unexpected end of archive")
-                out.write(chunk)
-                remaining -= len(chunk)
+        try:
+            with open(target, "wb") as out:
+                while remaining > 0:
+                    chunk = stream.read(min(remaining, _COPY_BUFSIZE))
+                    if not chunk:
+                        raise ArchiveError("Unexpected end of archive")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+        except BaseException:
+            # never leave a truncated file behind
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            raise
         _skip(stream, data_pad)
         try:
             os.utime(target, (entry.mtime, entry.mtime))

@@ -75,6 +75,11 @@ class AirDropConfig:
         receive_dir=None,
         timeout=10.0,
         ask_timeout=120.0,
+        accept_callback=None,
+        max_upload_size=None,
+        max_connections=16,
+        session_timeout=600.0,
+        save_links=True,
     ):
         self.airdrop_dir = os.path.abspath(os.path.expanduser(airdrop_dir))
         os.makedirs(self.airdrop_dir, exist_ok=True)
@@ -97,6 +102,15 @@ class AirDropConfig:
 
         self.timeout = timeout
         self.ask_timeout = ask_timeout
+
+        # Receiver policy. ``accept_callback(request)`` receives an
+        # :class:`~opendrop.server.TransferRequest` and returns True to accept.
+        # ``None`` accepts everything (historic behaviour).
+        self.accept_callback = accept_callback
+        self.max_upload_size = max_upload_size  # bytes, None = unlimited
+        self.max_connections = max_connections
+        self.session_timeout = session_timeout  # seconds between /Ask and /Upload
+        self.save_links = save_links  # append received URLs to received_links.txt
 
         self.email = email or []
         self.phone = phone or []
@@ -164,7 +178,7 @@ class AirDropConfig:
         from cryptography.x509.oid import NameOID
 
         logger.info(f"Create new self-signed certificate in {self.key_dir}")
-        os.makedirs(self.key_dir, exist_ok=True)
+        os.makedirs(self.key_dir, mode=0o700, exist_ok=True)
 
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.computer_name[:64])])
